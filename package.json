@@ -1,0 +1,14 @@
+{
+  "name": "release-provenance-attestor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GenLayer Intelligent Contract: consensus-graded release provenance attestor",
+  "scripts": {
+    "deploy": "node scripts/deploy.mjs",
+    "test": "pytest -q"
+  },
+  "dependencies": {
+    "genlayer-js": "^1.1.8"
+  }
+}
