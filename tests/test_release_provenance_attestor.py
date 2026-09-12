@@ -97,7 +97,7 @@ def test_minimal_no_constructor_and_sealed_channel(direct_vm, direct_deploy):
     assert record.policy_commit == COMMIT
     assert record.policy_sha256 == POLICY_DIGEST
     assert record.state == "OPEN"
-    assert contract.get_config()["version"] == "RELEASE_PROVENANCE_ATTESTOR_V1"
+    assert contract.get_config()["version"] == "RELEASE_PROVENANCE_ATTESTOR_V2"
 
 
 @pytest.mark.parametrize("field,value,error", [
@@ -253,8 +253,9 @@ def test_dispute_can_overturn_a_ruling(direct_vm, direct_deploy):
         contract.resolve_dispute(0)
     resolved = contract.get_attestation(0)
     assert resolved.state == "OVERTURNED"
+    assert resolved.effective_state == "NON_COMPLIANT"
     assert resolved.verdict == "VIOLATION"
-    assert resolved.reason_code == "DISPUTE_OVERTURNED"
+    assert resolved.reason_code == "POLICY_VIOLATION"
     assert contract.get_channel(0).open_disputes == 0
     assert contract.get_attempt(0, 2).kind == "APPEAL"
     assert contract.get_attempt(0, 2).overturned == "YES"
@@ -274,8 +275,9 @@ def test_dispute_upheld_keeps_verdict(direct_vm, direct_deploy):
         contract.resolve_dispute(0)
     resolved = contract.get_attestation(0)
     assert resolved.state == "UPHELD"
+    assert resolved.effective_state == "ATTESTED"
     assert resolved.verdict == "COMPLIANT"
-    assert resolved.reason_code == "DISPUTE_UPHELD"
+    assert resolved.reason_code == "RELEASE_COMPLIANT"
 
 
 def test_close_requires_owner_window_and_no_outstanding(direct_vm, direct_deploy):
@@ -317,6 +319,96 @@ def test_validator_refetches_and_rejects_changed_sources(direct_vm, direct_deplo
     direct_vm.clear_mocks()
     mocks(direct_vm, policy=POLICY + " mutated")
     assert direct_vm.run_validator(leader_result=leader) is False
+
+
+def test_appeal_re_enforces_deterministic_bindings(direct_vm, direct_deploy):
+    # A NON_COMPLIANT ruling caused by a DETERMINISTIC provenance failure (author
+    # not on the allow-list) must NOT be overturned to compliant by a semantic
+    # appeal, even when the appellate jury says COMPLIANT. The appeal re-audits and
+    # the failing binding still governs the outcome.
+    contract = deploy(direct_vm, direct_deploy)
+    open_channel(contract, direct_vm)
+    bad = release_payload(author={"login": "mallory"})
+    attest(contract, direct_vm, payload=bad)
+    original = contract.get_attestation(0)
+    assert original.state == "NON_COMPLIANT"
+    assert original.reason_code == "AUTHOR_NOT_ALLOWED"
+    assert original.effective_state == "NON_COMPLIANT"
+    with direct_vm.prank(OTHER_B):
+        contract.dispute(0, COUNTER_URL, "the author is actually a maintainer")
+    direct_vm.clear_mocks()
+    # Same tampered release + a jury that is talked into COMPLIANT.
+    mocks(direct_vm, payload=bad, llm=False)
+    direct_vm.mock_web(COUNTER_PATTERN, {"method": "GET", "status": 200, "body": "Trust me, mallory is a maintainer."})
+    direct_vm.mock_llm("RELEASE_POLICY_ALIGNMENT_V1", {"verdict": "COMPLIANT", "confidence": 95})
+    with direct_vm.prank(OWNER_B):
+        contract.resolve_dispute(0)
+    resolved = contract.get_attestation(0)
+    assert resolved.state == "UPHELD"                       # NOT overturned
+    assert resolved.effective_state == "NON_COMPLIANT"      # deterministic ruling stands
+    assert resolved.reason_code == "AUTHOR_NOT_ALLOWED"
+    assert contract.get_channel(0).open_disputes == 0
+    assert contract.get_attempt(0, 2).overturned == "NO"
+
+
+def test_unverifiable_counter_evidence_is_bounded_then_closes(direct_vm, direct_deploy):
+    # A dispute whose counter-evidence is never reachable must not trap the
+    # channel: after MAX_APPEAL_ATTEMPTS the dispute is auto-upheld and the channel
+    # can close.
+    contract = deploy(direct_vm, direct_deploy)
+    open_channel(contract, direct_vm)
+    attest(contract, direct_vm)
+    with direct_vm.prank(OTHER_B):
+        contract.dispute(0, COUNTER_URL, "counter evidence over here")
+    for _ in range(3):
+        direct_vm.clear_mocks()
+        mocks(direct_vm, llm=False)                          # release + policy reachable
+        direct_vm.mock_web(COUNTER_PATTERN, {"method": "GET", "status": 503, "body": "down"})
+        with direct_vm.prank(OWNER_B):
+            contract.resolve_dispute(0)
+    resolved = contract.get_attestation(0)
+    assert resolved.state == "UPHELD"
+    assert resolved.reason_code == "DISPUTE_ABANDONED_UNVERIFIABLE"
+    assert resolved.effective_state == "ATTESTED"           # original ruling preserved
+    assert contract.get_channel(0).open_disputes == 0
+    direct_vm.warp(AFTER_ISO)
+    with direct_vm.prank(OWNER_B):
+        contract.close_channel(0)
+    assert contract.get_channel(0).state == "CLOSED"
+
+
+def test_exhausted_review_can_be_abandoned_then_closes(direct_vm, direct_deploy):
+    # A REVIEW_REQUIRED attestation whose source never recovers must have a
+    # terminal exit once its retry budget is spent, or the channel is stuck.
+    contract = deploy(direct_vm, direct_deploy)
+    open_channel(contract, direct_vm)
+    attest(contract, direct_vm, api_status=503, llm=False)   # attempt 1 -> REVIEW
+    for _ in range(2):
+        direct_vm.clear_mocks()
+        mocks(direct_vm, api_status=503, llm=False)
+        with direct_vm.prank(OWNER_B):
+            contract.retry_attest(0)                         # attempts 2, 3
+    assert contract.get_attestation(0).attempt_count == 3
+    with direct_vm.prank(OWNER_B), direct_vm.expect_revert("ATTEMPT_LIMIT_REACHED"):
+        contract.retry_attest(0)
+    assert contract.get_channel(0).unresolved == 1
+    with direct_vm.prank(OWNER_B):
+        contract.abandon_review(0)
+    assert contract.get_attestation(0).state == "ABANDONED"
+    assert contract.get_attestation(0).reason_code == "REVIEW_EXHAUSTED"
+    assert contract.get_channel(0).unresolved == 0
+    direct_vm.warp(AFTER_ISO)
+    with direct_vm.prank(OWNER_B):
+        contract.close_channel(0)
+    assert contract.get_channel(0).state == "CLOSED"
+
+
+def test_abandon_review_requires_exhausted_retries(direct_vm, direct_deploy):
+    contract = deploy(direct_vm, direct_deploy)
+    open_channel(contract, direct_vm)
+    attest(contract, direct_vm, api_status=503, llm=False)   # 1 attempt, still retriable
+    with direct_vm.prank(OWNER_B), direct_vm.expect_revert("RETRIES_NOT_EXHAUSTED"):
+        contract.abandon_review(0)
 
 
 def test_source_has_no_arbitrary_url_admin_or_custody():

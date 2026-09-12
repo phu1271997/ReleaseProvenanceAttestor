@@ -34,23 +34,31 @@ from genlayer import *
 # verdict, the confidence band, and the evidence digest match. Two validators may
 # reason in different words yet must reach the same verdict to finalize.
 #
-# Any account may DISPUTE a terminal ruling with counter-evidence; an appellate
-# jury re-adjudicates the notes together with the counter-evidence page and may
-# OVERTURN the original verdict. "overturned" is DERIVED from the verdict delta,
-# never trusted from a free-form model flag - that is what makes the appeal
-# round consensus-meaningful rather than a rubber stamp.
+# Any account may DISPUTE a terminal ruling with counter-evidence. The appeal is a
+# FULL re-audit: it re-fetches the release and policy, RE-ENFORCES every
+# deterministic binding (tag, author, publication, timing, asset, policy digest),
+# and only then lets the jury re-judge the notes together with the counter
+# evidence. A deterministic provenance failure therefore can NEVER be overturned
+# into a compliant ruling by a purely semantic appeal - the appeal derives its
+# outcome through the same _derive() gate as the original audit, so bindings win.
+#
+# Every terminal path is bounded: exhausted review retries can be abandoned to a
+# terminal ABANDONED state, and a dispute whose counter-evidence stays
+# invalid/unavailable is auto-upheld after MAX_APPEAL_ATTEMPTS, so a channel can
+# never be trapped with a DISPUTED or REVIEW_REQUIRED attestation outstanding.
 #
 # Other contracts plug this in wherever a published release must be gated on
 # machine facts AND a human-language policy: release automation, package-registry
 # admission, bug-bounty payout gates, or DAO-governed shipping controls.
 
-VERSION = "RELEASE_PROVENANCE_ATTESTOR_V1"
+VERSION = "RELEASE_PROVENANCE_ATTESTOR_V2"
 GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 PROMPT_TAG = "RELEASE_POLICY_ALIGNMENT_V1"
 
 MAX_ATTEMPTS = 3
 MAX_DISPUTES = 3
+MAX_APPEAL_ATTEMPTS = 3   # bounded retries before an unverifiable dispute is auto-upheld
 MAX_POLICY_BYTES = 32768
 MAX_RELEASE_BYTES = 262144
 MAX_COUNTER_BYTES = 65536
@@ -67,6 +75,7 @@ PENDING = "PENDING"
 ATTESTED = "ATTESTED"
 NON_COMPLIANT = "NON_COMPLIANT"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
+ABANDONED = "ABANDONED"
 DISPUTED = "DISPUTED"
 OVERTURNED = "OVERTURNED"
 UPHELD = "UPHELD"
@@ -112,12 +121,14 @@ class Attestation:
     attestation_id: u256
     channel_id: u256
     tag: str
-    state: str
+    state: str                  # lifecycle/display state
+    effective_state: str        # the compliance ruling of record (ATTESTED|NON_COMPLIANT|ABANDONED|"")
     reason_code: str
     verdict: str                # COMPLIANT | PARTIAL | VIOLATION | ""
     confidence_band: u8         # 0 low / 1 medium / 2 high
-    attempt_count: u8
+    attempt_count: u8           # monotonic record index across audits + appeals
     dispute_count: u8
+    resolve_attempts: u8        # consecutive unverifiable resolves in the current dispute
     evidence_digest: str
     counter_evidence: str
     published_at: u256
@@ -397,7 +408,27 @@ def _classify(prompt: str) -> tuple:
         return PARTIAL, 0
 
 
-def _observe(channel: Channel, tag: str) -> dict:
+def _empty(source_status: str) -> dict:
+    return {
+        "source_status": source_status,
+        "tag_binding": UNCLEAR,
+        "author_binding": UNCLEAR,
+        "publication_binding": UNCLEAR,
+        "timing_binding": UNCLEAR,
+        "asset_binding": UNCLEAR,
+        "policy_binding": UNCLEAR,
+        "policy_alignment": UNCLEAR,
+        "confidence_band": 0,
+        "evidence_digest": "",
+        "published_at": 0,
+    }
+
+
+def _observe(channel: Channel, tag: str, counter_url: str = "", original_verdict: str = "") -> dict:
+    # One observer serves both the audit and the appeal. When counter_url is set
+    # (appeal), the counter-evidence page is fetched and folded into the semantic
+    # prompt, but the DETERMINISTIC bindings are recomputed identically. The
+    # appeal therefore cannot bless a release whose provenance does not hold.
     try:
         release_bytes = _body(gl.nondet.web.get(_release_url(channel, tag)), MAX_RELEASE_BYTES)
         try:
@@ -436,8 +467,12 @@ def _observe(channel: Channel, tag: str) -> dict:
             "asset_binding": MATCH if asset_ok else MISMATCH,
             "policy_binding": MATCH if policy_digest == channel.policy_sha256 else MISMATCH,
         }
-        verdict, band = _classify(_prompt(channel, policy, release["body"]))
-        canonical = json.dumps({"release": release, "policy_sha256": policy_digest}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if counter_url:
+            counter_text = _body(gl.nondet.web.get(counter_url), MAX_COUNTER_BYTES).decode("utf-8", errors="ignore")
+            verdict, band = _classify(_appeal_prompt(channel, policy, release["body"], counter_text, original_verdict or PARTIAL))
+        else:
+            verdict, band = _classify(_prompt(channel, policy, release["body"]))
+        canonical = json.dumps({"release": release, "policy_sha256": policy_digest, "appeal": bool(counter_url)}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return {
             "source_status": VERIFIED,
             **bindings,
@@ -450,22 +485,6 @@ def _observe(channel: Channel, tag: str) -> dict:
         return _empty(UNAVAILABLE)
     except Exception:
         return _empty(INVALID)
-
-
-def _empty(source_status: str) -> dict:
-    return {
-        "source_status": source_status,
-        "tag_binding": UNCLEAR,
-        "author_binding": UNCLEAR,
-        "publication_binding": UNCLEAR,
-        "timing_binding": UNCLEAR,
-        "asset_binding": UNCLEAR,
-        "policy_binding": UNCLEAR,
-        "policy_alignment": UNCLEAR,
-        "confidence_band": 0,
-        "evidence_digest": "",
-        "published_at": 0,
-    }
 
 
 def _valid_observation(value: Any) -> bool:
@@ -512,48 +531,6 @@ def _derive(observation: dict) -> tuple:
     return ATTESTED, "RELEASE_COMPLIANT"
 
 
-def _observe_appeal(channel: Channel, tag: str, counter_url: str, original_verdict: str) -> dict:
-    try:
-        release_bytes = _body(gl.nondet.web.get(_release_url(channel, tag)), MAX_RELEASE_BYTES)
-        payload = json.loads(release_bytes.decode("utf-8"))
-        if not isinstance(payload, dict):
-            return {"status": INVALID, "verdict": UNCLEAR, "confidence_band": 0, "overturned": "NA", "evidence_digest": ""}
-        release = _canonical_release(payload)
-        policy_bytes = _body(gl.nondet.web.get(_policy_url(channel)), MAX_POLICY_BYTES)
-        policy = policy_bytes.decode("utf-8")
-        if not policy.strip() or hashlib.sha256(policy_bytes).hexdigest() != channel.policy_sha256:
-            return {"status": INVALID, "verdict": UNCLEAR, "confidence_band": 0, "overturned": "NA", "evidence_digest": ""}
-        counter_bytes = _body(gl.nondet.web.get(counter_url), MAX_COUNTER_BYTES)
-        counter = counter_bytes.decode("utf-8", errors="ignore")
-        verdict, band = _classify(_appeal_prompt(channel, policy, release["body"], counter, original_verdict))
-        overturned = "YES" if verdict != _norm_verdict(original_verdict) else "NO"
-        canonical = json.dumps({"tag": release["tag_name"], "verdict": verdict, "overturned": overturned, "policy_sha256": channel.policy_sha256}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        return {"status": VERIFIED, "verdict": verdict, "confidence_band": band, "overturned": overturned, "evidence_digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
-    except ConnectionError:
-        return {"status": UNAVAILABLE, "verdict": UNCLEAR, "confidence_band": 0, "overturned": "NA", "evidence_digest": ""}
-    except Exception:
-        return {"status": INVALID, "verdict": UNCLEAR, "confidence_band": 0, "overturned": "NA", "evidence_digest": ""}
-
-
-def _valid_appeal(value: Any) -> bool:
-    if not isinstance(value, dict) or set(value.keys()) != {"status", "verdict", "confidence_band", "overturned", "evidence_digest"}:
-        return False
-    if value["status"] not in {VERIFIED, UNAVAILABLE, INVALID}:
-        return False
-    if value["verdict"] not in {COMPLIANT, PARTIAL, VIOLATION, UNCLEAR}:
-        return False
-    if value["overturned"] not in {"YES", "NO", "NA"}:
-        return False
-    if not isinstance(value["confidence_band"], int) or isinstance(value["confidence_band"], bool) or value["confidence_band"] not in (0, 1, 2):
-        return False
-    digest = value["evidence_digest"]
-    if not isinstance(digest, str):
-        return False
-    if value["status"] != VERIFIED:
-        return value["verdict"] == UNCLEAR and value["overturned"] == "NA" and value["confidence_band"] == 0 and digest == ""
-    return value["verdict"] != UNCLEAR and value["overturned"] in {"YES", "NO"} and len(digest) == 64
-
-
 class ReleaseProvenanceAttestor(gl.Contract):
     channel_count: u256
     attestation_count: u256
@@ -583,32 +560,18 @@ class ReleaseProvenanceAttestor(gl.Contract):
         self.channel_count = channel_id + u256(1)
         return channel_id
 
-    def _consensus(self, channel: Channel, tag: str) -> dict:
-        sealed_channel, sealed_tag = channel, tag
+    def _consensus(self, channel: Channel, tag: str, counter_url: str = "", original_verdict: str = "") -> dict:
+        sealed_channel, sealed_tag, sealed_counter, sealed_original = channel, tag, counter_url, original_verdict
         def leader_fn() -> dict:
-            return _observe(sealed_channel, sealed_tag)
+            return _observe(sealed_channel, sealed_tag, sealed_counter, sealed_original)
         def validator_fn(leader_result: Any) -> bool:
             leader = leader_result.calldata if isinstance(leader_result, gl.vm.Return) else leader_result
             if not _valid_observation(leader):
                 return False
-            validator = _observe(sealed_channel, sealed_tag)
+            validator = _observe(sealed_channel, sealed_tag, sealed_counter, sealed_original)
             return _valid_observation(validator) and all(leader[k] == validator[k] for k in leader.keys())
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         _require(_valid_observation(result), "CONSENSUS_VALIDATION_FAILED")
-        return result
-
-    def _appeal_consensus(self, channel: Channel, tag: str, counter_url: str, original_verdict: str) -> dict:
-        sealed_channel, sealed_tag, sealed_counter, sealed_original = channel, tag, counter_url, original_verdict
-        def leader_fn() -> dict:
-            return _observe_appeal(sealed_channel, sealed_tag, sealed_counter, sealed_original)
-        def validator_fn(leader_result: Any) -> bool:
-            leader = leader_result.calldata if isinstance(leader_result, gl.vm.Return) else leader_result
-            if not _valid_appeal(leader):
-                return False
-            validator = _observe_appeal(sealed_channel, sealed_tag, sealed_counter, sealed_original)
-            return _valid_appeal(validator) and leader == validator
-        result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-        _require(_valid_appeal(result), "CONSENSUS_VALIDATION_FAILED")
         return result
 
     def _record_attempt(self, attestation_id: u256, attempt: int, kind: str, observation: dict, state: str, reason: str, overturned: str) -> None:
@@ -639,6 +602,7 @@ class ReleaseProvenanceAttestor(gl.Contract):
         attestation.verdict = observation["policy_alignment"] if observation["source_status"] == VERIFIED else ""
         attestation.confidence_band = u8(int(observation["confidence_band"]))
         if state != REVIEW_REQUIRED:
+            attestation.effective_state = state
             attestation.evidence_digest = observation["evidence_digest"]
             attestation.published_at = u256(int(observation["published_at"]))
             channel.unresolved = channel.unresolved - u256(1)
@@ -655,7 +619,7 @@ class ReleaseProvenanceAttestor(gl.Contract):
         replay_key = f"{int(channel_id)}:{clean_tag}"
         _require(not self.audited_tags.get(replay_key, False), "TAG_ALREADY_AUDITED")
         attestation_id = self.attestation_count
-        self.attestations[attestation_id] = Attestation(attestation_id, channel_id, clean_tag, PENDING, "", "", u8(0), u8(0), u8(0), "", "", u256(0))
+        self.attestations[attestation_id] = Attestation(attestation_id, channel_id, clean_tag, PENDING, "", "", "", u8(0), u8(0), u8(0), u8(0), "", "", u256(0))
         self.audited_tags[replay_key] = True
         channel.attestation_count = channel.attestation_count + u256(1)
         channel.unresolved = channel.unresolved + u256(1)
@@ -669,16 +633,37 @@ class ReleaseProvenanceAttestor(gl.Contract):
         self._evaluate(attestation_id, REVIEW_REQUIRED)
 
     @gl.public.write
+    def abandon_review(self, attestation_id: u256) -> None:
+        # Bounded terminal recovery for a REVIEW_REQUIRED attestation whose source
+        # or model never became conclusive. Once the retry budget is exhausted the
+        # channel owner can retire it to a terminal ABANDONED state so the channel
+        # is not blocked from closing forever.
+        _require(attestation_id in self.attestations, "ATTESTATION_NOT_FOUND")
+        attestation = self.attestations[attestation_id]
+        channel = self.channels[attestation.channel_id]
+        _require(gl.message.sender_address == channel.owner, "CHANNEL_OWNER_ONLY")
+        _require(attestation.state == REVIEW_REQUIRED, "NOT_IN_REVIEW")
+        _require(int(attestation.attempt_count) >= MAX_ATTEMPTS, "RETRIES_NOT_EXHAUSTED")
+        attestation.state = ABANDONED
+        attestation.effective_state = ABANDONED
+        attestation.reason_code = "REVIEW_EXHAUSTED"
+        self.attestations[attestation_id] = attestation
+        channel.unresolved = channel.unresolved - u256(1)
+        self.channels[attestation.channel_id] = channel
+
+    @gl.public.write
     def dispute(self, attestation_id: u256, counter_evidence_url: str, reason: str) -> None:
         _require(attestation_id in self.attestations, "ATTESTATION_NOT_FOUND")
         attestation = self.attestations[attestation_id]
         channel = self.channels[attestation.channel_id]
         _require(attestation.state in (ATTESTED, NON_COMPLIANT, UPHELD, OVERTURNED), "NOT_DISPUTABLE")
+        _require(attestation.effective_state in (ATTESTED, NON_COMPLIANT), "NOT_DISPUTABLE")
         _require(int(attestation.dispute_count) < MAX_DISPUTES, "DISPUTE_LIMIT_REACHED")
         url = _https(counter_evidence_url, "INVALID_COUNTER_URL")
         _require(isinstance(reason, str) and 8 <= len(reason.strip()) <= 500, "INVALID_DISPUTE_REASON")
         attestation.state = DISPUTED
         attestation.dispute_count = u8(int(attestation.dispute_count) + 1)
+        attestation.resolve_attempts = u8(0)
         attestation.counter_evidence = url
         self.attestations[attestation_id] = attestation
         channel.open_disputes = channel.open_disputes + u256(1)
@@ -690,30 +675,50 @@ class ReleaseProvenanceAttestor(gl.Contract):
         attestation = self.attestations[attestation_id]
         channel = self.channels[attestation.channel_id]
         _require(attestation.state == DISPUTED, "NO_ACTIVE_DISPUTE")
-        original_verdict = attestation.verdict or PARTIAL
-        result = self._appeal_consensus(channel, attestation.tag, attestation.counter_evidence, original_verdict)
-        _require(result["status"] == VERIFIED, "APPEAL_NOT_VERIFIED")
+        baseline = attestation.effective_state          # ATTESTED | NON_COMPLIANT
+        # FULL re-audit with counter-evidence folded into the semantic prompt.
+        observation = self._consensus(channel, attestation.tag, attestation.counter_evidence, attestation.verdict or PARTIAL)
         attempt_number = int(attestation.attempt_count) + 1
-        overturned = result["overturned"]
-        new_state = OVERTURNED if overturned == "YES" else UPHELD
-        # Re-derive the terminal ruling from the appellate verdict so an overturn
-        # actually changes the machine-readable outcome, not just a label.
-        new_verdict = result["verdict"]
-        new_reason = "DISPUTE_OVERTURNED" if overturned == "YES" else "DISPUTE_UPHELD"
-        appeal_obs = {
-            "source_status": VERIFIED,
-            "tag_binding": MATCH, "author_binding": MATCH, "publication_binding": MATCH,
-            "timing_binding": MATCH, "asset_binding": MATCH, "policy_binding": MATCH,
-            "policy_alignment": new_verdict, "confidence_band": int(result["confidence_band"]),
-            "evidence_digest": result["evidence_digest"], "published_at": int(attestation.published_at),
-        }
-        self._record_attempt(attestation_id, attempt_number, "APPEAL", appeal_obs, new_state, new_reason, overturned)
+
+        if observation["source_status"] != VERIFIED:
+            # Counter-evidence (or a source) could not be verified. Record the
+            # attempt and bound the retries: after MAX_APPEAL_ATTEMPTS the dispute
+            # is terminally abandoned (the original ruling stands) so it can never
+            # stay stuck as DISPUTED.
+            self._record_attempt(attestation_id, attempt_number, "APPEAL", observation, REVIEW_REQUIRED, "APPEAL_SOURCE_NOT_VERIFIED", "NA")
+            attestation.attempt_count = u8(attempt_number)
+            attestation.resolve_attempts = u8(int(attestation.resolve_attempts) + 1)
+            if int(attestation.resolve_attempts) >= MAX_APPEAL_ATTEMPTS:
+                attestation.state = UPHELD
+                attestation.reason_code = "DISPUTE_ABANDONED_UNVERIFIABLE"
+                attestation.counter_evidence = ""
+                channel.open_disputes = channel.open_disputes - u256(1)
+                self.channels[attestation.channel_id] = channel
+            self.attestations[attestation_id] = attestation
+            return
+
+        new_state, new_reason = _derive(observation)
+        if new_state == REVIEW_REQUIRED:
+            # Deterministic bindings hold but the appellate jury is inconclusive:
+            # an appeal cannot overturn on an unclear result - the original stands.
+            display, overturned, reason_code = UPHELD, "NO", "DISPUTE_INCONCLUSIVE"
+            effective = baseline
+            verdict = attestation.verdict
+        else:
+            overturned = "YES" if new_state != baseline else "NO"
+            display = OVERTURNED if overturned == "YES" else UPHELD
+            reason_code = new_reason
+            effective = new_state
+            verdict = observation["policy_alignment"]
+
+        self._record_attempt(attestation_id, attempt_number, "APPEAL", observation, display, reason_code, overturned)
         attestation.attempt_count = u8(attempt_number)
-        attestation.state = new_state
-        attestation.reason_code = new_reason
-        attestation.verdict = new_verdict
-        attestation.confidence_band = u8(int(result["confidence_band"]))
-        attestation.evidence_digest = result["evidence_digest"]
+        attestation.state = display
+        attestation.effective_state = effective
+        attestation.reason_code = reason_code
+        attestation.verdict = verdict
+        attestation.confidence_band = u8(int(observation["confidence_band"]))
+        attestation.evidence_digest = observation["evidence_digest"]
         attestation.counter_evidence = ""
         self.attestations[attestation_id] = attestation
         channel.open_disputes = channel.open_disputes - u256(1)
@@ -733,7 +738,7 @@ class ReleaseProvenanceAttestor(gl.Contract):
 
     @gl.public.view
     def get_config(self) -> dict:
-        return {"version": VERSION, "github_api": GITHUB_API, "github_raw": GITHUB_RAW, "max_attempts": u8(MAX_ATTEMPTS), "max_disputes": u8(MAX_DISPUTES), "channel_count": self.channel_count, "attestation_count": self.attestation_count}
+        return {"version": VERSION, "github_api": GITHUB_API, "github_raw": GITHUB_RAW, "max_attempts": u8(MAX_ATTEMPTS), "max_disputes": u8(MAX_DISPUTES), "max_appeal_attempts": u8(MAX_APPEAL_ATTEMPTS), "channel_count": self.channel_count, "attestation_count": self.attestation_count}
 
     @gl.public.view
     def get_channel(self, channel_id: u256) -> Channel:

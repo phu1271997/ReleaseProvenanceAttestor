@@ -7,7 +7,7 @@ notes honour a sealed, human-language security policy, and it exposes a
 permissionless **appeal** path that can overturn a ruling.
 
 - **Network:** GenLayer studionet (chain id `61999`, rpc `https://studio.genlayer.com/api`)
-- **Live contract:** [`0x7D63C69f23e4362974E2831b3F6926935B327cC4`](https://studio.genlayer.com/contracts)
+- **Live contract:** [`0x3A81686Dd16F0c0d45C4A0DF1d823E2bF3a36DD9`](https://studio.genlayer.com/contracts)
 - **Contribution type:** Builder → Intelligent Contracts (standalone primitive, no frontend)
 
 ---
@@ -50,19 +50,33 @@ consensus while a genuine disagreement about *meaning* does.
 ## Appeal round (backward state transition)
 
 Any account — not just the channel owner — may `dispute` a terminal ruling with a
-**counter-evidence URL** and a reason. `resolve_dispute` runs a second jury that
-re-reads the release notes together with the counter-evidence page and returns a
-fresh verdict. Whether the ruling is **OVERTURNED** is **derived from the verdict
-delta**, never trusted from a free-form model flag — that is what makes the
-appeal consensus-meaningful. The state machine therefore has a real backward
-edge:
+**counter-evidence URL** and a reason. `resolve_dispute` is a **full re-audit**:
+it re-fetches the GitHub release and the sealed policy, **re-enforces every
+deterministic binding** (tag, author, publication, timing, asset, policy digest),
+and only then lets the appellate jury re-judge the notes together with the
+counter-evidence page. The outcome runs through the **same `_derive()` gate** as
+the original audit, so a **deterministic provenance failure can never be
+overturned into a compliant ruling by a purely semantic appeal** — the failing
+binding still governs. `effective_state` records the compliance ruling of record;
+`OVERTURNED` means it genuinely changed, `UPHELD` means the original stands.
 
 ```
 PENDING ─▶ ATTESTED ─────┐
-        └▶ NON_COMPLIANT ─┼─▶ DISPUTED ─▶ OVERTURNED
-        └▶ REVIEW_REQUIRED┘             └▶ UPHELD
-                 ▲   (retry, bounded by MAX_ATTEMPTS)
+        ├▶ NON_COMPLIANT ─┼─▶ DISPUTED ─▶ OVERTURNED
+        │                 │            └▶ UPHELD
+        └▶ REVIEW_REQUIRED┘
+             │  ▲ retry (bounded by MAX_ATTEMPTS)
+             └─▶ ABANDONED   (terminal, once retries are exhausted)
 ```
+
+Every terminal path is **bounded** so a channel can never be trapped:
+
+- A `REVIEW_REQUIRED` attestation whose source/model never becomes conclusive can
+  be retired to a terminal `ABANDONED` state via `abandon_review` once its retry
+  budget is spent — freeing `close_channel`.
+- A dispute whose counter-evidence stays invalid/unavailable is **auto-upheld**
+  after `MAX_APPEAL_ATTEMPTS`, clearing `open_disputes`, instead of reverting
+  forever and leaving the attestation stuck as `DISPUTED`.
 
 This is exactly where GenLayer's Optimistic Democracy appeal cycle creates value
 a Solidity contract cannot reproduce.
@@ -74,8 +88,9 @@ a Solidity contract cannot reproduce.
 | `open_channel(repo_owner, repo_name, maintainers, policy_commit, policy_path, policy_sha256, required_asset, allow_prerelease, starts_at, ends_at)` | write | Seal a repo + pinned policy + release envelope. Returns `channel_id`. |
 | `attest_release(channel_id, tag)` | write | Audit one published release. Returns `attestation_id`. Owner-only, one attestation per `(channel, tag)`. |
 | `retry_attest(attestation_id)` | write | Re-run after a transient source/model failure (`REVIEW_REQUIRED`). |
+| `abandon_review(attestation_id)` | write | Owner retires an exhausted `REVIEW_REQUIRED` attestation to terminal `ABANDONED`. |
 | `dispute(attestation_id, counter_evidence_url, reason)` | write | **Permissionless.** Challenge a terminal ruling with counter-evidence. |
-| `resolve_dispute(attestation_id)` | write | Appellate jury; may `OVERTURN` or `UPHOLD`. |
+| `resolve_dispute(attestation_id)` | write | Full re-audit + appellate jury; `OVERTURNED` / `UPHELD`, or auto-upheld after bounded unverifiable retries. |
 | `close_channel(channel_id)` | write | Owner closes after the window, once nothing is outstanding. |
 | `get_config` / `get_channel` / `get_attestation` / `get_attempt` / `list_disputed` | view | Read config, records, and the full per-attempt audit trail. |
 
@@ -102,7 +117,7 @@ rejects a mutated policy on refetch.
 
 ## Tests
 
-`tests/test_release_provenance_attestor.py` — **28 tests**, GenLayer Test direct
+`tests/test_release_provenance_attestor.py` — **32 tests**, GenLayer Test direct
 mode with mocked web + LLM. Run:
 
 ```bash
@@ -125,7 +140,7 @@ live studionet address.
 
 ```
 contracts/release_provenance_attestor.py   # the primitive (ASCII-only, # v0.2.16)
-tests/test_release_provenance_attestor.py  # 28 gltest cases
+tests/test_release_provenance_attestor.py  # 32 gltest cases
 sanity/storage_test.py                     # deploy-first sanity contract
 scripts/deploy.mjs                         # studionet deployer
 docs/SPECIFICATION.md                      # detailed spec
